@@ -15,8 +15,17 @@ const DOW = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
 const MONTHS = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
 const SECTIONS = ['Сделано', 'Начато, не доделано', 'Не вышло', 'Лог', 'Заметка дня', 'Задачи на завтра'];
 const HOURS = Array.from({ length: 17 }, (_, i) => i + 7);   // 07…23
+const APP_VERSION = '2026-10-19.4';
+const clone = typeof structuredClone === 'function' ? structuredClone : v => JSON.parse(JSON.stringify(v));   // старые WebView без structuredClone
+let flashTimer = 0;
+let saveTimer = 0;
+
+// Любой сбой — на экран: раньше такая кнопка просто молчала.
+window.addEventListener('error', e => showError(e.error || e.message));
+window.addEventListener('unhandledrejection', e => showError(e.reason));
 
 // Списки занятий и триггеров пустые: их заводит пользователь в настройках или прямо в форме отметки.
+// Названия правятся в «Настройках», ключи при этом не меняются.
 // Роли: goal_activity — занятие, чьи минуты идут в greenhouse_min и цель недели;
 // trigger_activity — занятие, у которого спрашивается триггер (заход в ленты не по плану).
 const DEFAULT_SETTINGS = {
@@ -104,8 +113,8 @@ const byDate = (a, b) => (a.date < b.date ? -1 : 1);
 const time = s => Date.parse(s) || 0;
 
 function normSettings(s) {
-  const out = structuredClone(DEFAULT_SETTINGS);
-  for (const k in out) if (s?.[k] != null) out[k] = structuredClone(s[k]);
+  const out = clone(DEFAULT_SETTINGS);
+  for (const k in out) if (s?.[k] != null) out[k] = clone(s[k]);
   out.checkins_on = out.checkins.map((_, i) => out.checkins_on[i] !== false);
   for (const name in LISTS) out[name] = out[name].map(x => (typeof x === 'string' ? { key: x, label: x } : x));
   // Данные первой версии: роли были зашиты в ключи greenhouse и phone_off.
@@ -116,7 +125,7 @@ function normSettings(s) {
 }
 
 function normDay(d) {
-  const day = { date: d.date, ...structuredClone(DAY_TEMPLATE), ...d };
+  const day = { date: d.date, ...clone(DAY_TEMPLATE), ...d };
   for (const k of ['done', 'started', 'failed', 'tomorrow']) if (!Array.isArray(day[k])) day[k] = [];
   day.rows = (day.rows || []).map(r => ({ ...ROW_TEMPLATE, ...r, id: r.id || newId() }));
   sortRows(day);
@@ -154,8 +163,15 @@ function loadMeta() {
 }
 
 function save() {
+  clearTimeout(saveTimer);
+  saveTimer = 0;
   try { store.set(STORE_KEY, JSON.stringify(db)); }
   catch (e) { flash('Не удалось сохранить: ' + e.message + '. Сделай экспорт JSON.'); }
+}
+// Ввод текста: запись через 0,4 с после паузы, а не на каждую букву (в APK каждая запись — синхронный вызов с fsync).
+function saveSoon() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(save, 400);
 }
 const saveMeta = () => store.set(META_KEY, JSON.stringify(meta));
 
@@ -166,16 +182,16 @@ const ui = { view: 'today', date: logicalDate(), today: logicalDate(), week: nul
 const getDay = date => db.days[date] || normDay({ date });
 
 // Любое изменение дня: отметка времени → сохранение → запись в папку (если подключена).
-function touch(day) {
+function touch(day, soon = false) {
   day.updated_at = isoLocal();
   db.days[day.date] = day;
-  save();
+  if (soon) saveSoon(); else save();
   folderQueue(day.date);
 }
-function setField(f, v) {
+function setField(f, v, soon = false) {
   const day = getDay(ui.date);
   day[f] = v;
-  touch(day);
+  touch(day, soon);
 }
 
 /* ───────────── Расчёты ───────────── */
@@ -481,22 +497,41 @@ function download(name, text, type) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  flash(`Файл «${name}» отправлен в загрузки браузера`);
   return true;
 }
 
 async function copyText(text, done = 'Скопировано') {
+  let ok = false;
   try {
     if (APK) APK.copy(text);
     else await navigator.clipboard.writeText(text);
-  } catch {   // старые браузеры и http:// без защищённого контекста
+    ok = true;
+  } catch { /* ниже запасной путь */ }
+  if (!ok) {   // старые браузеры и http:// без защищённого контекста
     const t = document.createElement('textarea');
     t.value = text;
+    t.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
     document.body.append(t);
     t.select();
-    document.execCommand('copy');
+    try { ok = document.execCommand('copy'); } catch { ok = false; }
     t.remove();
   }
-  flash(done);
+  flash(ok ? done : 'Не удалось скопировать. Скачай .md или открой приложение в другом браузере');
+}
+
+// Что показать, если что-то не работает: версия, среда и последняя ошибка.
+function diagText() {
+  const nRows = Object.values(db.days).reduce((n, d) => n + d.rows.length, 0);
+  return [
+    `Лог дня ${APP_VERSION} · ${APK ? 'APK' : 'браузер'}`,
+    `Адрес: ${location.origin}`,
+    `Устройство: ${navigator.userAgent}`,
+    `Экран: ${innerWidth}×${innerHeight}, плотность ${devicePixelRatio}`,
+    `Дней: ${Object.keys(db.days).length}, строк лога: ${nRows}, занятий: ${db.settings.activities.length}`,
+    `Папка journal: ${FOLDER_OK ? 'доступна' : 'недоступна здесь'}`,
+    `Последняя ошибка: ${meta.last_error ? `${meta.last_error.at} ${meta.last_error.text}` : 'нет'}`,
+  ].join('\n');
 }
 
 function exportJson() {
@@ -556,11 +591,28 @@ const chip = (act, arg, label, on) =>
   `<button type="button" class="chip${on ? ' on' : ''}" data-act="${act}" data-arg="${esc(arg)}" aria-pressed="${!!on}">${esc(label)}</button>`;
 const lines = v => v.split('\n').map(s => s.trim()).filter(Boolean);
 
-function render() {
+// Разметка экрана строкой: по ней tick() понимает, изменилось ли что-то, и не пересоздаёт кнопки зря
+// (иначе нажатие, пришедшееся на перерисовку, терялось).
+let lastHtml = '';
+function buildHtml() {
   const views = { today: viewToday, row: viewRow, close: viewClose, week: viewWeek, settings: viewSettings };
   const current = ui.view === 'row' || ui.view === 'close' ? 'today' : ui.view;
   const tab = (v, label) => `<button type="button" class="${current === v ? 'on' : ''}" data-act="go" data-arg="${v}">${label}</button>`;
-  app.innerHTML = `<nav class="tabs">${tab('today', 'Сегодня')}${tab('week', 'Неделя')}${tab('settings', 'Настройки')}</nav>` + views[ui.view]();
+  return `<nav class="tabs">${tab('today', 'Сегодня')}${tab('week', 'Неделя')}${tab('settings', 'Настройки')}</nav>` + views[ui.view]();
+}
+
+function render() {
+  try {
+    lastHtml = buildHtml();
+  } catch (e) {   // экран не собрался: показываем «Сегодня», а не пустую страницу
+    showError(e);
+    ui.view = 'today';
+    ui.draft = null;
+    ui.adding = null;
+    try { lastHtml = buildHtml(); }
+    catch (e2) { lastHtml = `<p class="warn">Экран не открылся: ${esc(e2.message)}. Данные целы: сделай экспорт JSON.</p>`; }
+  }
+  app.innerHTML = lastHtml;
   document.body.dataset.view = ui.view;
 }
 
@@ -576,7 +628,7 @@ ${folder.handle && !folder.ok ? `<div class="banner">Папка journal ждёт
 <header class="daynav">
   <button type="button" class="icon" data-act="shiftDay" data-arg="-1" aria-label="Предыдущий день">‹</button>
   <h1>${cap(fmtDate(ui.date))}${isToday ? '' : '<small>прошедший день</small>'}</h1>
-  <button type="button" class="icon" data-act="shiftDay" data-arg="1" aria-label="Следующий день" ${isToday ? 'disabled' : ''}>›</button>
+  ${isToday ? '<span></span>' : '<button type="button" class="icon" data-act="shiftDay" data-arg="1" aria-label="Следующий день">›</button>'}
 </header>
 <section class="card">
   <div class="field"><label for="wake">Подъём</label>
@@ -585,10 +637,10 @@ ${folder.handle && !folder.ok ? `<div class="banner">Папка journal ждёт
     <input id="main" type="text" data-bind="main_result" value="${esc(day.main_result)}" placeholder="одна строка" autocomplete="off" enterkeyhint="done"></div>
 </section>
 <h2>Отметки</h2>
-<div class="cks">${cks.map(c => `<button type="button" class="ck ${c.st}" data-act="newRow"><b>${c.t} ${marks[c.st][0]}</b><small>${marks[c.st][1]}</small></button>`).join('')}</div>
+<ul class="cks" aria-label="Статус отметок">${cks.map(c => `<li class="ck ${c.st}"><b>${c.t} ${marks[c.st][0]}</b><small>${marks[c.st][1]}</small></li>`).join('')}</ul>
 <h2>Лог <small>${day.rows.length ? `${day.rows.length} стр. · ${fmtDur(total)}` : ''}</small></h2>
 ${rowsList(day)}
-<p class="muted small">Данные хранятся только на этом устройстве. ${btn('exportJson', '', 'Резервная копия (JSON)', 'link')}</p>
+<p class="muted small">Данные хранятся только на этом устройстве. Резервная копия — в «Настройках».</p>
 <div class="bar">${btn('newRow', '', due ? 'Отметка · пора' : 'Отметка', 'primary' + (due ? ' due' : ''))}${btn('go', 'close', 'Закрыть день')}</div>`;
 }
 
@@ -615,6 +667,7 @@ function rowItem(r) {
     r.flow ? 'flow' : '', r.recalled ? 'по памяти' : '',
   ].filter(Boolean);
   return `<button type="button" class="logrow" data-act="editRow" data-arg="${r.id}">
+  <span class="go" aria-hidden="true">›</span>
   <span class="t">${r.from}–${r.to}<small>${fmtDur(rowMin(r))}</small></span>
   <span class="a">${esc(actLabel(r.activity))}${r.note ? `<em>: ${esc(r.note)}</em>` : ''}</span>
   <span class="m">${sg('энергия', r.energy)} · ${sg('вовл.', r.engagement)}${extra.length ? ' · ' + extra.join(' ') : ''}</span></button>`;
@@ -630,7 +683,8 @@ function draftInfo() {
   const d = ui.draft;
   if (!d.from || !d.to) return ['', ''];
   const ov = overlaps(getDay(ui.date), d);
-  return [fmtDur(rowMin(d)), ov.length ? 'Пересекается: ' + ov.map(r => `${r.from}–${r.to} ${actLabel(r.activity)}`).join(', ') : ''];
+  const zero = d.from === d.to ? 'Длина 0 минут: поправь «От» или «До». ' : '';
+  return [fmtDur(rowMin(d)), zero + (ov.length ? 'Пересекается: ' + ov.map(r => `${r.from}–${r.to} ${actLabel(r.activity)}`).join(', ') : '')];
 }
 
 function showDraftInfo() {
@@ -659,7 +713,7 @@ function viewRow() {
   const d = ui.draft, [dur, warn] = draftInfo();
   const three = (f, labels) => `<div class="seg">${[-1, 0, 1].map((v, i) => chip('setDraft', `${f}:${v}`, labels[i], d[f] === v)).join('')}</div>`;
   return `
-<header class="formhead"><h1>${d.id ? 'Правка строки' : 'Отметка'} <small>${cap(fmtDate(ui.date))}</small></h1></header>
+<header class="formhead">${btn('cancelRow', '', 'Отмена', 'flat')}<h1>${d.id ? 'Правка строки' : 'Отметка'} <small>${cap(fmtDate(ui.date))}</small></h1></header>
 <div class="times">
   <label>От<input type="time" data-bind="row.from" value="${d.from}"></label>
   <label>До<input type="time" data-bind="row.to" value="${d.to}"></label>
@@ -693,7 +747,7 @@ function viewClose() {
   const yn = (f, label) => `<div class="yn"><span>${label}</span><div class="seg">${chip('setBool', f + ':true', 'да', day[f] === true)}${chip('setBool', f + ':false', 'нет', day[f] === false)}</div></div>`;
   const area = (f, label, ph) => `<div class="field"><label for="${f}">${label}</label><textarea id="${f}" rows="3" data-bind="${f}" placeholder="${ph}">${esc(day[f].join('\n'))}</textarea></div>`;
   return `
-<header class="formhead"><h1>Закрыть день <small>${cap(fmtDate(ui.date))}</small></h1></header>
+<header class="formhead"><h1>Закрыть день <small>${cap(fmtDate(ui.date))}</small></h1>${btn('closeDone', '', 'Готово', 'flat strong')}</header>
 <section class="card">
   <div class="field"><label for="wake">Подъём</label>
     <div class="inline"><input id="wake" type="time" data-bind="wake" value="${day.wake || ''}">${btn('wakeNow', '', 'Сейчас')}</div></div>
@@ -764,10 +818,12 @@ function listEditor(name, ph) {
   let firstShown = true;
   const items = list.map((x, i) => {
     if (x.hidden) return '';
-    const up = `<button type="button" class="icon" data-act="listUp" data-arg="${name}:${i}" aria-label="Выше" ${firstShown ? 'disabled' : ''}>↑</button>`;
+    // у первого пункта стрелки нет: поднимать некуда, а неактивная кнопка выглядит сломанной
+    const up = firstShown ? '<span class="icon-gap"></span>'
+      : `<button type="button" class="icon" data-act="listUp" data-arg="${name}:${i}" aria-label="Поднять «${esc(x.label)}» выше">↑</button>`;
     firstShown = false;
     return `<li><input type="text" value="${esc(x.label)}" data-set="label" data-list="${name}" data-i="${i}" aria-label="Название" autocomplete="off">${up}` +
-      `<button type="button" class="icon" data-act="listDelete" data-arg="${name}:${i}" aria-label="Удалить">✕</button></li>`;
+      `<button type="button" class="icon danger" data-act="listDelete" data-arg="${name}:${i}" aria-label="Удалить «${esc(x.label)}»">✕</button></li>`;
   }).join('');
   return (items ? `<ul class="edit">${items}</ul>` : '<p class="muted small">Пока пусто.</p>') + addBox(name, ph) +
     (hidden.length ? `<p class="muted small">Скрыты, потому что есть в записях: ${hidden.map(x => `${esc(x.label)} ${btn('listRestore', `${name}:${list.indexOf(x)}`, 'вернуть', 'link')}`).join(' · ')}</p>` : '');
@@ -816,12 +872,22 @@ ${folderSection()}
   <h2>Демо и сброс</h2>
   <p class="muted small">Демо-неделя пишется в прошлую неделю и только в пустые дни.</p>
   <div class="btns">${btn('demo', '', 'Заполнить демо-неделей')}${btn('demoClear', '', 'Убрать демо-дни')}${btn('wipe', '', 'Удалить все данные', 'danger')}</div>
+</section>
+<section class="card">
+  <h2>Диагностика</h2>
+  <p class="muted small">Версия ${APP_VERSION} · ${APK ? 'APK' : 'браузер'}. ${meta.last_error ? `Последняя ошибка (${esc(meta.last_error.at.slice(0, 16).replace('T', ' '))}): ${esc(meta.last_error.text)}` : 'Ошибок не было.'}</p>
+  <div class="btns">${btn('copyDiag', '', 'Скопировать диагностику')}</div>
 </section>`;
 }
 
 /* ───────────── Действия ───────────── */
 
-let flashTimer = 0;
+function showError(e) {
+  const text = String(e?.message || e || 'неизвестная ошибка');
+  try { meta.last_error = { at: isoLocal(), text }; saveMeta(); } catch { /* сообщение важнее записи */ }
+  flash('Ошибка: ' + text);
+}
+
 function flash(text) {
   const el = document.getElementById('flash');
   el.textContent = text;
@@ -918,6 +984,8 @@ const actions = {
   shiftWeek(n) { ui.week = addDays(ui.week, 7 * n); render(); },
   wakeNow() { setField('wake', hm(now())); render(); },
   newRow() { ui.draft = newDraft(getDay(ui.date)); showView('row'); },
+  cancelRow() { ui.draft = null; showView('today'); },
+  closeDone() { showView('today'); flash('День сохранён'); },
   fillGap(arg) {
     const [from, to] = arg.split('-');
     ui.draft = { ...newDraft(getDay(ui.date), from), to };
@@ -939,8 +1007,9 @@ const actions = {
   },
   saveRow(more) {
     const d = ui.draft, day = getDay(ui.date);
-    const miss = [!d.from || !d.to ? 'время' : '', d.activity ? '' : 'занятие', d.energy == null ? 'энергию' : '', d.engagement == null ? 'вовлечённость' : ''].filter(Boolean);
+    const miss = [!d.from ? 'время «От»' : '', !d.to ? 'время «До»' : '', d.activity ? '' : 'занятие', d.energy == null ? 'энергию' : '', d.engagement == null ? 'вовлечённость' : ''].filter(Boolean);
     if (miss.length) return flash('Выбери: ' + miss.join(', '));
+    if (d.from === d.to) return flash('«От» и «До» совпадают: строка получится длиной 0 минут');
     const row = toRow(d), i = day.rows.findIndex(r => r.id === row.id);
     if (i >= 0) day.rows[i] = row; else day.rows.push(row);
     sortRows(day);
@@ -978,6 +1047,7 @@ const actions = {
   copyMd: () => copyText(dayMarkdown(getDay(ui.date)), 'Markdown дня скопирован'),
   downloadMd: () => download(ui.date + '.md', dayMarkdown(getDay(ui.date)), 'text/markdown'),
   copyWeek: () => copyText(weekMarkdown(ui.week), 'Итоги недели скопированы'),
+  copyDiag: () => copyText(diagText(), 'Диагностика скопирована'),
   exportJson,
   exportCsv: () => download(`daylog-rows-${logicalDate()}.csv`, rowsCsv(), 'text/csv'),
   importPick: () => document.getElementById('importFile').click(),
@@ -993,7 +1063,7 @@ const actions = {
     flash('Демо-дни и демо-пункты списков убраны');
   },
   wipe() {
-    if (!confirm('Удалить все дни и настройки из этого браузера? Сначала сделай экспорт JSON.')) return;
+    if (!confirm(`Удалить все дни и настройки ${APK ? 'из приложения' : 'из этого браузера'}? Сначала сделай экспорт JSON.`)) return;
     for (const d of Object.keys(db.days)) delete db.days[d];
     db.settings = normSettings();
     save();
@@ -1011,17 +1081,17 @@ const actions = {
 // Поля, которые сохраняются на каждый ввод (без перерисовки — чтобы не терять фокус).
 const binds = {
   wake: v => setField('wake', v || null),
-  main_result: v => setField('main_result', v),
+  main_result: v => setField('main_result', v, true),
   screen: v => {
     const m = parseScreen(v);
-    setField('screen_min', m);
+    setField('screen_min', m, true);
     document.getElementById('screenHint').textContent = screenHint(m, v.trim());
   },
-  note: v => setField('note', v),
-  done: v => setField('done', lines(v)),
-  started: v => setField('started', lines(v)),
-  failed: v => setField('failed', lines(v)),
-  tomorrow: v => setField('tomorrow', lines(v)),
+  note: v => setField('note', v, true),
+  done: v => setField('done', lines(v), true),
+  started: v => setField('started', lines(v), true),
+  failed: v => setField('failed', lines(v), true),
+  tomorrow: v => setField('tomorrow', lines(v), true),
   'row.from': v => { ui.draft.from = v; showDraftInfo(); },
   'row.to': v => { ui.draft.to = v; showDraftInfo(); },
   'row.note': v => (ui.draft.note = v),
@@ -1063,8 +1133,11 @@ function applySetting(el) {
         const list = s[el.dataset.list], label = clean(v);
         if (!label) throw new Error('название не может быть пустым');
         if (list.some((x, j) => j !== i && x.label.toLowerCase() === label.toLowerCase())) throw new Error(`«${label}» уже есть в списке`);
+        const old = list[i].label;
         list[i].label = label;
         delete list[i].demo;
+        // подписи ↑ и ✕ этой строки называют пункт по имени — обновляем без перерисовки (фокус уже мог уйти дальше)
+        for (const b of el.parentElement.querySelectorAll('[aria-label]')) b.setAttribute('aria-label', b.getAttribute('aria-label').replace(`«${old}»`, `«${label}»`));
         break;
       }
       case 'goal_activity':
@@ -1080,7 +1153,15 @@ function applySetting(el) {
 
 app.addEventListener('click', e => {
   const el = e.target.closest('[data-act]');
-  if (el && !el.disabled) actions[el.dataset.act](el.dataset.arg, el);
+  if (!el || el.disabled) return;
+  const fn = actions[el.dataset.act];
+  if (!fn) return showError(new Error('у кнопки нет действия: ' + el.dataset.act));
+  try {
+    const r = fn(el.dataset.arg, el);
+    if (r && typeof r.catch === 'function') r.catch(showError);
+  } catch (err) {
+    showError(err);
+  }
 });
 app.addEventListener('input', e => {
   const el = e.target, fn = binds[el.dataset.bind];
@@ -1166,6 +1247,8 @@ function fillDemo() {
 // Файлы ГГГГ-ММ-ДД.md в формате 1.5. Доступ к папке хранится в IndexedDB, разрешение браузер может сбросить.
 
 const folder = { handle: null, ok: false, timer: 0, queue: new Set() };
+// В WebView и Chrome на Андроиде showDirectoryPicker есть, но выбора папки нет: кнопка молчала. Там режим папки скрыт.
+const FOLDER_OK = !APK && !!window.showDirectoryPicker && !/Android/i.test(navigator.userAgent);
 
 function kv(mode, fn) {
   return new Promise((resolve, reject) => {
@@ -1181,7 +1264,7 @@ function kv(mode, fn) {
 }
 
 function folderSection() {
-  if (!window.showDirectoryPicker) return '';   // Safari, Firefox, Android — только экспорт
+  if (!FOLDER_OK) return '';   // Safari, Firefox, Android и APK — только экспорт
   const status = !folder.handle ? 'Не подключена. Приложение будет читать и писать файлы дней ГГГГ-ММ-ДД.md, чужие разделы не трогает.'
     : folder.ok ? `Подключена «${esc(folder.handle.name)}». Дни пишутся в файлы автоматически.`
     : `«${esc(folder.handle.name)}»: браузер сбросил разрешение.`;
@@ -1191,7 +1274,7 @@ function folderSection() {
 }
 
 async function folderInit() {
-  if (!window.showDirectoryPicker) return;
+  if (!FOLDER_OK) return;
   folder.handle = (await kv('readonly', s => s.get('journal'))) || null;
   if (folder.handle) folder.ok = (await folder.handle.queryPermission({ mode: 'readwrite' })) === 'granted';
   if (folder.ok) await folderSync();
@@ -1267,6 +1350,7 @@ async function folderSync() {
 
 /* ───────────── Запуск ───────────── */
 
+
 // Раз в полминуты и при возвращении в приложение: обновить «пора» и перейти на новые сутки после 04:00.
 function tick() {
   const t = logicalDate();
@@ -1274,12 +1358,13 @@ function tick() {
     if (ui.date === ui.today) ui.date = t;
     ui.today = t;
   }
-  if (ui.view === 'today' && !app.contains(document.activeElement)) render();
+  if (ui.view === 'today' && !app.contains(document.activeElement) && buildHtml() !== lastHtml) render();
 }
 
 render();
 setInterval(tick, 30000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) { if (saveTimer) save(); } else tick(); });
+window.addEventListener('pagehide', () => { if (saveTimer) save(); });
 folderInit().then(() => folder.handle && render()).catch(() => {});
 // Кнопка «Назад» в APK: с формы — на день, с других экранов — на «Сегодня», с «Сегодня» — выход.
 window.daylogBack = () => {

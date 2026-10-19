@@ -1,6 +1,6 @@
 // Офлайн-кэш «Лога дня»: файлы приложения отдаются из кэша и тихо обновляются из сети.
 // При изменении файлов приложения подними номер версии.
-const CACHE = 'daylog-v4';
+const CACHE = 'daylog-v7';
 const FILES = ['./', 'index.html', 'app.js', 'styles.css', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png'];
 
 // Хостинг (GitHub Pages) отдаёт файлы с max-age=600, поэтому мимо HTTP-кэша браузера:
