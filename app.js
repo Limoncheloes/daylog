@@ -1,7 +1,7 @@
 'use strict';
 /*
  * Лог дня — запись дня за минуту. Без фреймворков, сборки и сети.
- * Данные: localStorage (ключ daylog.v1). Экспорт: JSON, Markdown (формат 1.5 из брифа), CSV.
+ * Данные: localStorage (ключ daylog.v1), в APK — файл приложения. Экспорт: JSON, Markdown (формат 1.5 из брифа), CSV.
  * Порядок файла: константы → время → данные → расчёты → Markdown → импорт/экспорт → экраны → действия → папка journal → запуск.
  */
 
@@ -127,13 +127,21 @@ function sortRows(day) {
   day.rows.sort((a, b) => dayMin(a.from) - dayMin(b.from) || rowMin(a) - rowMin(b));
 }
 
+// window.Android — мост из APK-обёртки (android-app). WebView пишет localStorage на диск с задержкой
+// в несколько секунд, и правка теряется, если система выгрузит приложение. Поэтому в APK данные сразу
+// пишутся в файл приложения (атомарно, с fsync), а в браузере — в localStorage.
+const APK = window.Android;
+const store = APK
+  ? { get: k => APK.getItem(k) ?? localStorage.getItem(k), set: (k, v) => { if (!APK.setItem(k, v)) throw new Error('файл не записан'); } }
+  : { get: k => localStorage.getItem(k), set: (k, v) => localStorage.setItem(k, v) };
+
 function load() {
   let raw = null, data = null;
   try {
-    raw = localStorage.getItem(STORE_KEY);
+    raw = store.get(STORE_KEY);
     data = JSON.parse(raw);
   } catch {
-    if (raw) localStorage.setItem(STORE_KEY + '.broken', raw);   // испорченное не затираем молча
+    if (raw) store.set(STORE_KEY + '.broken', raw);   // испорченное не затираем молча
   }
   const db = { version: 1, settings: normSettings(data?.settings), days: {} };
   for (const d of Object.values(data?.days || {})) if (d?.date) db.days[d.date] = normDay(d);
@@ -141,15 +149,15 @@ function load() {
 }
 
 function loadMeta() {
-  try { return { last_backup_at: null, written: {}, ...JSON.parse(localStorage.getItem(META_KEY)) }; }
+  try { return { last_backup_at: null, written: {}, ...JSON.parse(store.get(META_KEY)) }; }
   catch { return { last_backup_at: null, written: {} }; }
 }
 
 function save() {
-  try { localStorage.setItem(STORE_KEY, JSON.stringify(db)); }
+  try { store.set(STORE_KEY, JSON.stringify(db)); }
   catch (e) { flash('Не удалось сохранить: ' + e.message + '. Сделай экспорт JSON.'); }
 }
-const saveMeta = () => localStorage.setItem(META_KEY, JSON.stringify(meta));
+const saveMeta = () => store.set(META_KEY, JSON.stringify(meta));
 
 const db = load();
 const meta = loadMeta();
@@ -458,7 +466,14 @@ function rowsCsv() {
   return '﻿' + out.join('\n') + '\n';   // BOM — чтобы Excel узнал UTF-8
 }
 
+// В APK нет скачиваний браузера: файл сохраняется через мост в «Загрузки/Лог дня».
+// Возвращает false, если файл сохранить не удалось.
 function download(name, text, type) {
+  if (APK) {
+    const where = APK.saveFile(name, text, type);
+    flash(where ? `Сохранено: ${where}` : 'Не удалось сохранить файл');
+    return !!where;
+  }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([text], { type: type + ';charset=utf-8' }));
   a.download = name;
@@ -466,11 +481,13 @@ function download(name, text, type) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  return true;
 }
 
 async function copyText(text, done = 'Скопировано') {
   try {
-    await navigator.clipboard.writeText(text);
+    if (APK) APK.copy(text);
+    else await navigator.clipboard.writeText(text);
   } catch {   // старые браузеры и http:// без защищённого контекста
     const t = document.createElement('textarea');
     t.value = text;
@@ -484,7 +501,7 @@ async function copyText(text, done = 'Скопировано') {
 
 function exportJson() {
   const data = { version: 1, exported_at: isoLocal(), settings: db.settings, days: Object.values(db.days).sort(byDate) };
-  download(`daylog-${logicalDate()}.json`, JSON.stringify(data, null, 2), 'application/json');
+  if (!download(`daylog-${logicalDate()}.json`, JSON.stringify(data, null, 2), 'application/json')) return;
   meta.last_backup_at = isoLocal();
   saveMeta();
   render();
@@ -766,7 +783,7 @@ function viewSettings() {
 <h1>Настройки и данные</h1>
 <section class="card">
   <h2>Данные</h2>
-  <p class="muted small">Хранятся только в этом браузере (localStorage). Дней: ${days.length}, строк лога: ${nRows}.
+  <p class="muted small">Хранятся только ${APK ? 'в этом приложении, в его файлах' : 'в этом браузере (localStorage)'}. Дней: ${days.length}, строк лога: ${nRows}.
   Последняя резервная копия: ${meta.last_backup_at ? meta.last_backup_at.slice(0, 16).replace('T', ' ') : 'ещё не было'}.</p>
   <div class="btns">${btn('exportJson', '', 'Экспорт JSON', 'primary')}${btn('importPick', '', 'Импорт JSON или .md')}${btn('exportCsv', '', 'CSV строк лога')}</div>
   <input type="file" id="importFile" accept=".json,.md,application/json,text/markdown" multiple hidden>
@@ -1264,4 +1281,13 @@ render();
 setInterval(tick, 30000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
 folderInit().then(() => folder.handle && render()).catch(() => {});
-if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
+// Кнопка «Назад» в APK: с формы — на день, с других экранов — на «Сегодня», с «Сегодня» — выход.
+window.daylogBack = () => {
+  if (ui.view === 'row' || ui.view === 'close') showView('today');
+  else if (ui.view !== 'today' || ui.date !== logicalDate()) actions.go('today');
+  else return false;
+  return true;
+};
+
+// В APK файлы и так лежат внутри приложения — офлайн-кэш не нужен.
+if (!APK && 'serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
